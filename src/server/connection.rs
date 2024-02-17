@@ -67,7 +67,7 @@ use std::collections::HashSet;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
 lazy_static::lazy_static! {
-    static ref LOGIN_FAILURES: Arc::<Mutex<HashMap<String, (i32, i32, i32)>>> = Default::default();
+    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<String, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     static ref AUTHED_CONNS: Arc::<Mutex<Vec<(i32, AuthConnType)>>> = Default::default();
@@ -150,6 +150,7 @@ struct Session {
     session_id: u64,
     last_recv_time: Arc<Mutex<Instant>>,
     random_password: String,
+    tfa: bool,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -181,6 +182,7 @@ pub struct Connection {
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
+    require_2fa: Option<totp_rs::TOTP>,
     keyboard: bool,
     clipboard: bool,
     audio: bool,
@@ -235,6 +237,8 @@ pub struct Connection {
     file_remove_log_control: FileRemoveLogControl,
     #[cfg(feature = "gpucodec")]
     supported_encoding_flag: (bool, Option<bool>),
+    user_session_id: Option<u32>,
+    checked_multiple_session: bool,
 }
 
 impl ConnInner {
@@ -317,6 +321,7 @@ impl Connection {
                 tx: Some(tx),
                 tx_video: Some(tx_video),
             },
+            require_2fa: crate::auth_2fa::get_2fa(None),
             display_idx: *display_service::PRIMARY_DISPLAY_IDX,
             stream,
             server,
@@ -381,6 +386,8 @@ impl Connection {
             file_remove_log_control: FileRemoveLogControl::new(id),
             #[cfg(feature = "gpucodec")]
             supported_encoding_flag: (false, None),
+            user_session_id: None,
+            checked_multiple_session: false,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -434,6 +441,7 @@ impl Connection {
                 Some(data) = rx_from_cm.recv() => {
                     match data {
                         ipc::Data::Authorize => {
+                            conn.require_2fa.take();
                             conn.send_logon_response().await;
                             if conn.port_forward_socket.is_some() {
                                 break;
@@ -572,6 +580,9 @@ impl Connection {
                                 *conn.last_recv_time.lock().unwrap() = Instant::now();
                                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
                                     if !conn.on_message(msg_in).await {
+                                        break;
+                                    }
+                                    if conn.port_forward_socket.is_some() && conn.authorized {
                                         break;
                                     }
                                 }
@@ -1029,6 +1040,11 @@ impl Connection {
         if self.authorized {
             return;
         }
+        if self.require_2fa.is_some() && !self.is_recent_session(true) && !self.from_switch {
+            self.send_login_error(crate::client::REQUIRE_2FA).await;
+            return;
+        }
+        self.authorized = true;
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -1162,7 +1178,6 @@ impl Connection {
                 username = "".to_owned();
             }
         }
-        self.authorized = true;
         #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         PLUGIN_BLOCK_INPUT_TXS
@@ -1210,7 +1225,7 @@ impl Connection {
                 Ok(displays) => {
                     // For compatibility with old versions, we need to send the displays to the peer.
                     // But the displays may be updated later, before creating the video capturer.
-                    pi.displays = displays.clone();
+                    pi.displays = displays;
                     pi.current_display = self.display_idx as _;
                     res.set_peer_info(pi);
                     sub_service = true;
@@ -1402,6 +1417,7 @@ impl Connection {
                         session_id: self.lr.session_id,
                         last_recv_time: self.last_recv_time.clone(),
                         random_password: password,
+                        tfa: false,
                     },
                 );
                 return true;
@@ -1415,7 +1431,7 @@ impl Connection {
         false
     }
 
-    fn is_recent_session(&mut self) -> bool {
+    fn is_recent_session(&mut self, tfa: bool) -> bool {
         SESSIONS
             .lock()
             .unwrap()
@@ -1426,21 +1442,18 @@ impl Connection {
             .get(&self.lr.my_id)
             .map(|s| s.to_owned());
         // last_recv_time is a mutex variable shared with connection, can be updated lively.
-        if let Some(session) = session {
+        if let Some(mut session) = session {
             if session.name == self.lr.my_name
                 && session.session_id == self.lr.session_id
                 && !self.lr.password.is_empty()
-                && self.validate_one_password(session.random_password.clone())
+                && (tfa && session.tfa
+                    || !tfa && self.validate_one_password(session.random_password.clone()))
             {
-                SESSIONS.lock().unwrap().insert(
-                    self.lr.my_id.clone(),
-                    Session {
-                        name: self.lr.my_name.clone(),
-                        session_id: self.lr.session_id,
-                        last_recv_time: self.last_recv_time.clone(),
-                        random_password: session.random_password,
-                    },
-                );
+                session.last_recv_time = self.last_recv_time.clone();
+                SESSIONS
+                    .lock()
+                    .unwrap()
+                    .insert(self.lr.my_id.clone(), session);
                 return true;
             }
         }
@@ -1482,8 +1495,50 @@ impl Connection {
         self.video_ack_required = lr.video_ack_required;
     }
 
+    #[cfg(target_os = "windows")]
+    async fn handle_multiple_user_sessions(&mut self, usid: Option<u32>) -> bool {
+        if self.port_forward_socket.is_some() {
+            return true;
+        } else {
+            let active_sessions = crate::platform::get_all_active_sessions();
+            if active_sessions.len() <= 1 {
+                return true;
+            }
+            let current_process_usid = crate::platform::get_current_process_session_id();
+            if usid.is_none() {
+                let mut res = Misc::new();
+                let mut rdp = Vec::new();
+                for session in active_sessions {
+                    let u_sid = &session[0];
+                    let u_name = &session[1];
+                    let mut rdp_session = RdpUserSession::new();
+                    rdp_session.user_session_id = u_sid.clone();
+                    rdp_session.user_name = u_name.clone();
+                    rdp.push(rdp_session);
+                }
+                res.set_rdp_user_sessions(RdpUserSessions {
+                    rdp_user_sessions: rdp,
+                    ..Default::default()
+                });
+                let mut msg_out = Message::new();
+                msg_out.set_misc(res);
+                self.send(msg_out).await;
+                return true;
+            }
+            if usid != Some(current_process_usid) {
+                self.on_close("Reconnecting...", false).await;
+                std::thread::spawn(move || {
+                    let _ = ipc::connect_to_user_session(usid);
+                });
+                return false;
+            }
+            true
+        }
+    }
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_start_cm_ipc(&mut self) {
+        let usid = self.user_session_id;
         if let Some(p) = self.start_cm_ipc_para.take() {
             tokio::spawn(async move {
                 #[cfg(windows)]
@@ -1493,6 +1548,7 @@ impl Connection {
                     p.tx_from_cm,
                     p.rx_desktop_ready,
                     p.tx_cm_stream_ready,
+                    usid.clone(),
                 )
                 .await
                 {
@@ -1504,9 +1560,9 @@ impl Connection {
                 }
             });
             #[cfg(all(windows, feature = "flutter"))]
-            std::thread::spawn(|| {
+            std::thread::spawn(move || {
                 if crate::is_server() && !crate::check_process("--tray", false) {
-                    crate::platform::run_as_user(vec!["--tray"]).ok();
+                    crate::platform::run_as_user(vec!["--tray"], usid).ok();
                 }
             });
         }
@@ -1514,6 +1570,19 @@ impl Connection {
 
     async fn on_message(&mut self, msg: Message) -> bool {
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            #[cfg(target_os = "windows")]
+            {
+                if !self.checked_multiple_session {
+                    let usid;
+                    match lr.option.user_session.parse::<u32>() {
+                        Ok(n) => usid = Some(n),
+                        Err(..) => usid = None,
+                    }
+                    if usid.is_some() {
+                        self.user_session_id = usid;
+                    }
+                }
+            }
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
@@ -1614,16 +1683,13 @@ impl Connection {
             {
                 self.send_login_error("Connection not allowed").await;
                 return false;
-            } else if self.is_recent_session() {
+            } else if self.is_recent_session(false) {
                 if err_msg.is_empty() {
                     #[cfg(all(target_os = "linux", feature = "linux_headless"))]
                     #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
-                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), true);
                     self.send_logon_response().await;
-                    if self.port_forward_socket.is_some() {
-                        return false;
-                    }
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
                 } else {
                     self.send_login_error(err_msg).await;
                 }
@@ -1637,47 +1703,12 @@ impl Connection {
                     .await;
                 }
             } else {
-                let mut failure = LOGIN_FAILURES
-                    .lock()
-                    .unwrap()
-                    .get(&self.ip)
-                    .map(|x| x.clone())
-                    .unwrap_or((0, 0, 0));
-                let time = (get_time() / 60_000) as i32;
-                if failure.2 > 30 {
-                    self.send_login_error("Too many wrong password attempts")
-                        .await;
-                    Self::post_alarm_audit(
-                        AlarmAuditType::ExceedThirtyAttempts,
-                        json!({
-                                    "ip":self.ip,
-                                    "id":lr.my_id.clone(),
-                                    "name": lr.my_name.clone(),
-                        }),
-                    );
-                } else if time == failure.0 && failure.1 > 6 {
-                    self.send_login_error("Please try 1 minute later").await;
-                    Self::post_alarm_audit(
-                        AlarmAuditType::SixAttemptsWithinOneMinute,
-                        json!({
-                                    "ip":self.ip,
-                                    "id":lr.my_id.clone(),
-                                    "name": lr.my_name.clone(),
-                        }),
-                    );
-                } else if !self.validate_password() {
-                    if failure.0 == time {
-                        failure.1 += 1;
-                        failure.2 += 1;
-                    } else {
-                        failure.0 = time;
-                        failure.1 = 1;
-                        failure.2 += 1;
-                    }
-                    LOGIN_FAILURES
-                        .lock()
-                        .unwrap()
-                        .insert(self.ip.clone(), failure);
+                let (failure, res) = self.check_failure(0).await;
+                if !res {
+                    return true;
+                }
+                if !self.validate_password() {
+                    self.update_failure(failure, false, 0);
                     if err_msg.is_empty() {
                         self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
                             .await;
@@ -1689,20 +1720,61 @@ impl Connection {
                         .await;
                     }
                 } else {
-                    if failure.0 != 0 {
-                        LOGIN_FAILURES.lock().unwrap().remove(&self.ip);
-                    }
+                    self.update_failure(failure, true, 0);
                     if err_msg.is_empty() {
                         #[cfg(all(target_os = "linux", feature = "linux_headless"))]
                         #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
                         self.linux_headless_handle.wait_desktop_cm_ready().await;
                         self.send_logon_response().await;
-                        self.try_start_cm(lr.my_id, lr.my_name, true);
-                        if self.port_forward_socket.is_some() {
-                            return false;
-                        }
+                        self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
                     } else {
                         self.send_login_error(err_msg).await;
+                    }
+                }
+            }
+        } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
+            let (failure, res) = self.check_failure(1).await;
+            if !res {
+                return true;
+            }
+            if let Some(totp) = self.require_2fa.as_ref() {
+                if let Ok(code) = totp.generate_current() {
+                    if tfa.code == code {
+                        self.update_failure(failure, true, 1);
+                        self.require_2fa.take();
+                        self.send_logon_response().await;
+                        self.try_start_cm(
+                            self.lr.my_id.to_owned(),
+                            self.lr.my_name.to_owned(),
+                            self.authorized,
+                        );
+                        let session = SESSIONS
+                            .lock()
+                            .unwrap()
+                            .get(&self.lr.my_id)
+                            .map(|s| s.to_owned());
+                        if let Some(mut session) = session {
+                            session.tfa = true;
+                            SESSIONS
+                                .lock()
+                                .unwrap()
+                                .insert(self.lr.my_id.clone(), session);
+                        } else {
+                            SESSIONS.lock().unwrap().insert(
+                                self.lr.my_id.clone(),
+                                Session {
+                                    name: self.lr.my_name.clone(),
+                                    session_id: self.lr.session_id,
+                                    last_recv_time: self.last_recv_time.clone(),
+                                    random_password: "".to_owned(),
+                                    tfa: true,
+                                },
+                            );
+                        }
+                    } else {
+                        self.update_failure(failure, false, 1);
+                        self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
+                            .await;
                     }
                 }
             }
@@ -1736,8 +1808,12 @@ impl Connection {
                     if let Some((_instant, uuid_old)) = uuid_old {
                         if uuid == uuid_old {
                             self.from_switch = true;
-                            self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), true);
                             self.send_logon_response().await;
+                            self.try_start_cm(
+                                lr.my_id.clone(),
+                                lr.my_name.clone(),
+                                self.authorized,
+                            );
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
                             self.try_start_cm_ipc();
                         }
@@ -1745,6 +1821,22 @@ impl Connection {
                 }
             }
         } else if self.authorized {
+            #[cfg(target_os = "windows")]
+            if !self.checked_multiple_session {
+                self.checked_multiple_session = true;
+                if crate::platform::is_installed()
+                    && crate::platform::is_share_rdp()
+                    && Self::alive_conns().len() == 1
+                    && get_version_number(&self.lr.version) >= get_version_number("1.2.4")
+                {
+                    if !self
+                        .handle_multiple_user_sessions(self.user_session_id)
+                        .await
+                    {
+                        return false;
+                    }
+                }
+            }
             match msg.union {
                 Some(message::Union::MouseEvent(me)) => {
                     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -2243,6 +2335,63 @@ impl Connection {
             }
         }
         true
+    }
+
+    fn update_failure(&self, (mut failure, time): ((i32, i32, i32), i32), remove: bool, i: usize) {
+        if remove {
+            if failure.0 != 0 {
+                LOGIN_FAILURES[i].lock().unwrap().remove(&self.ip);
+            }
+            return;
+        }
+        if failure.0 == time {
+            failure.1 += 1;
+            failure.2 += 1;
+        } else {
+            failure.0 = time;
+            failure.1 = 1;
+            failure.2 += 1;
+        }
+        LOGIN_FAILURES[i]
+            .lock()
+            .unwrap()
+            .insert(self.ip.clone(), failure);
+    }
+
+    async fn check_failure(&mut self, i: usize) -> (((i32, i32, i32), i32), bool) {
+        let failure = LOGIN_FAILURES[i]
+            .lock()
+            .unwrap()
+            .get(&self.ip)
+            .map(|x| x.clone())
+            .unwrap_or((0, 0, 0));
+        let time = (get_time() / 60_000) as i32;
+        let res = if failure.2 > 30 {
+            self.send_login_error("Too many wrong attempts").await;
+            Self::post_alarm_audit(
+                AlarmAuditType::ExceedThirtyAttempts,
+                json!({
+                            "ip": self.ip,
+                            "id": self.lr.my_id.clone(),
+                            "name": self.lr.my_name.clone(),
+                }),
+            );
+            false
+        } else if time == failure.0 && failure.1 > 6 {
+            self.send_login_error("Please try 1 minute later").await;
+            Self::post_alarm_audit(
+                AlarmAuditType::SixAttemptsWithinOneMinute,
+                json!({
+                            "ip": self.ip,
+                            "id": self.lr.my_id.clone(),
+                            "name": self.lr.my_name.clone(),
+                }),
+            );
+            false
+        } else {
+            true
+        };
+        ((failure, time), res)
     }
 
     fn refresh_video_display(&self, display: Option<usize>) {
@@ -2937,6 +3086,7 @@ async fn start_ipc(
     tx_from_cm: mpsc::UnboundedSender<ipc::Data>,
     mut _rx_desktop_ready: mpsc::Receiver<()>,
     tx_stream_ready: mpsc::Sender<()>,
+    user_session_id: Option<u32>,
 ) -> ResultType<()> {
     use hbb_common::anyhow::anyhow;
 
@@ -2984,7 +3134,7 @@ async fn start_ipc(
         if crate::platform::is_root() {
             let mut res = Ok(None);
             for _ in 0..10 {
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     log::debug!("Start cm");
                     res = crate::platform::run_as_user(args.clone());
@@ -2997,6 +3147,11 @@ async fn start_ipc(
                         user.clone(),
                         None::<(&str, &str)>,
                     );
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    log::debug!("Start cm");
+                    res = crate::platform::run_as_user(args.clone(), user_session_id);
                 }
                 if res.is_ok() {
                     break;
@@ -3332,6 +3487,10 @@ extern "C" fn connection_shutdown_hook() {
 }
 
 mod raii {
+    // CONN_COUNT: remote connection count in fact
+    // ALIVE_CONNS: all connections, including unauthorized connections
+    // AUTHED_CONNS: all authorized connections
+
     use super::*;
     pub struct ConnectionID(i32);
 

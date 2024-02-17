@@ -180,6 +180,12 @@ pub fn session_login(
     }
 }
 
+pub fn session_send2fa(session_id: SessionID, code: String) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send2fa(code);
+    }
+}
+
 pub fn session_close(session_id: SessionID) {
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         session.close_event_stream(session_id);
@@ -211,9 +217,9 @@ pub fn session_record_status(session_id: SessionID, status: bool) {
     }
 }
 
-pub fn session_reconnect(session_id: SessionID, force_relay: bool) {
+pub fn session_reconnect(session_id: SessionID, force_relay: bool, user_session_id: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.reconnect(force_relay);
+        session.reconnect(force_relay, user_session_id);
     }
     session_on_waiting_for_image_dialog_show(session_id);
 }
@@ -835,7 +841,7 @@ pub fn main_check_connect_status() {
 }
 
 pub fn main_is_using_public_server() -> bool {
-    using_public_server()
+    crate::using_public_server()
 }
 
 pub fn main_discover() {
@@ -2014,6 +2020,18 @@ pub fn main_supported_input_source() -> SyncReturn<String> {
                 .unwrap_or_default(),
         )
     }
+}
+
+pub fn main_generate2fa() -> String {
+    generate2fa()
+}
+
+pub fn main_verify2fa(code: String) -> bool {
+    verify2fa(code)
+}
+
+pub fn main_has_valid_2fa_sync() -> SyncReturn<bool> {
+    SyncReturn(has_valid_2fa())
 }
 
 #[cfg(target_os = "android")]
